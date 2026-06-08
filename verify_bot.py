@@ -125,8 +125,8 @@ def test_success_state():
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     white_pixels = np.sum(gray > 200)
     
-    print(f"White pixels (>200): {white_pixels} (Threshold: >200)")
-    is_success = white_pixels > 200
+    print(f"White pixels (>200): {white_pixels} (Threshold: >350)")
+    is_success = white_pixels > 350
     print(f"Success detected: {is_success} (Expected: True)")
     assert is_success, "Failed: false negative success detection"
 
@@ -137,10 +137,46 @@ def test_success_on_waiting():
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     white_pixels = np.sum(gray > 200)
     
-    print(f"White pixels (>200): {white_pixels} (Threshold: >200)")
-    is_success = white_pixels > 200
+    print(f"White pixels (>200): {white_pixels} (Threshold: >350)")
+    is_success = white_pixels > 350
     print(f"Success detected: {is_success} (Expected: False)")
     assert not is_success, "Failed: false positive success detection"
+def test_adaptive_controller():
+    print("\n--- Test 7: Adaptive Controller Logic & Adaptation ---")
+    from adaptive_controller import AdaptiveController
+    ctrl = AdaptiveController(base_pulse=0.04, initial_kp=1.0, initial_kd=0.15)
+    
+    # Minigame stats: green bounds [100, 200], center 150, half-width 50
+    # Scenario 1: Indicator is at 150 (perfectly centered)
+    key, pulse, log = ctrl.update(150, 100, 200)
+    print(f"Center check: Key={key}, Pulse={pulse}, Log={log}")
+    assert key is None, "Failed: should not steer when centered"
+    
+    # Scenario 2: Indicator is far left at 50
+    key, pulse, log = ctrl.update(50, 100, 200)
+    print(f"Far left check: Key={key}, Pulse={pulse}, Log={log}")
+    assert key == 'd', "Failed: should steer right when indicator is left"
+    assert pulse > 0.04, f"Failed: pulse should be scaled higher than base pulse. Pulse={pulse}"
+    
+    # Scenario 3: Sluggish check (feed same far-left error 6 times to trigger Kp increase)
+    for i in range(4):
+        key, pulse, log = ctrl.update(50, 100, 200)
+    # The 6th time should trigger Kp increase
+    key, pulse, log = ctrl.update(50, 100, 200)
+    print(f"Sluggish response check (after 6 frames): Key={key}, Pulse={pulse}, Log={log}")
+    assert log is not None and "Increasing Kp" in log, f"Failed: should trigger Kp increase on sluggish response. Log={log}"
+    assert ctrl.kp > 1.0, f"Failed: Kp should have increased. Kp={ctrl.kp}"
+    
+    # Scenario 4: Oscillation check (crossing side from left to right rapidly)
+    # Let's say we cross to far right (250) and it's within 0.8s
+    # Note: We need to set the side and cross times.
+    # Let's call update with a right-side error
+    key, pulse, log = ctrl.update(250, 100, 200)
+    print(f"Oscillation check: Key={key}, Pulse={pulse}, Log={log}")
+    assert log is not None and "Oscillation detected" in log, f"Failed: should trigger oscillation damping. Log={log}"
+    assert ctrl.kp < 1.2, f"Failed: Kp should have decreased. Kp={ctrl.kp}"
+    
+    print("Adaptive Controller tests passed!")
 
 if __name__ == "__main__":
     try:
@@ -150,6 +186,8 @@ if __name__ == "__main__":
         test_minigame_state()
         test_success_state()
         test_success_on_waiting()
+        test_adaptive_controller()
         print("\n" + "="*40 + "\nALL TESTS PASSED SUCCESSFULLY!\n" + "="*40)
     except AssertionError as e:
         print(f"\nTEST FAILED: {e}")
+
