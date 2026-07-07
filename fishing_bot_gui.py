@@ -496,14 +496,13 @@ class FishingBotGUI:
     def test_crop_popup(self):
         """
         Grabs a screenshot of the current game bounds and opens a secondary
-        window with live crops of the regions (F-Icon, Bar, Success Banner)
-        to calibrate offline.
+        window with the full image and interactive rectangles overlaid for each ROI.
         """
-        global window_rect, crop_window
+        global window_rect, crop_window, bot_instance
         self.detect_window(silent=True)
         
-        # Use full primary screen coordinates if window is not detected
         if not window_rect:
+            import mss
             with mss.mss() as sct:
                 monitor = sct.monitors[1]
                 w_rect = (0, 0, monitor["width"], monitor["height"])
@@ -514,12 +513,13 @@ class FishingBotGUI:
         width = right - left
         height = bottom - top
 
-        # Setup reference crops
-        # Create a temp instance of bot to utilize its scaling methods
-        temp_bot = FishingBot(window_rect=w_rect)
+        import fishing_bot
+        temp_bot = fishing_bot.FishingBot(window_rect=w_rect)
         
+        import mss
+        import numpy as np
+        import cv2
         with mss.mss() as sct:
-            # Capture the entire window/screen bounds
             monitor = {"top": top, "left": left, "width": width, "height": height}
             try:
                 screenshot = sct.grab(monitor)
@@ -530,14 +530,13 @@ class FishingBotGUI:
                 
             img = np.array(screenshot)
             img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-            # Scale crops relative to actual image
+            
             bar_crop = temp_bot.process_screenshot(sct, temp_bot.roi_bar)
             f_crop = temp_bot.process_screenshot(sct, temp_bot.roi_f_icon)
             success_crop = temp_bot.process_screenshot(sct, temp_bot.roi_success)
-
-        # Let's perform analysis on these crops to show feedback
-        # 1. F-icon analysis
+            
+        annotated_full = img.copy()
+        
         hsv_f = cv2.cvtColor(f_crop, cv2.COLOR_BGR2HSV)
         lower_blue = np.array([100, 100, 100])
         upper_blue = np.array([125, 255, 255])
@@ -547,18 +546,24 @@ class FishingBotGUI:
         bite_analysis = "No blue pixels found."
         ring_complete = "NO"
         if len(x_indices) > 0:
-            cx, cy = 67, 35
+            gray_f = cv2.cvtColor(f_crop, cv2.COLOR_BGR2GRAY)
+            wy, wx = np.where(gray_f > 200)
+            if len(wx) > 5:
+                cx = int(np.median(wx))
+                cy = int(np.median(wy))
+            else:
+                cx, cy = 50, 35
+                
             l_h = np.sum(x_indices < cx)
             r_h = np.sum(x_indices >= cx)
             t_h = np.sum(y_indices < cy)
             b_h = np.sum(y_indices >= cy)
             bite_analysis = f"Blue Px: L={l_h}, R={r_h}, T={t_h}, B={b_h}"
-            if (l_h >= 35) and (r_h >= 35) and (t_h >= 35) and (b_h >= 35):
+            if (l_h >= 75) and (r_h >= 75) and (t_h >= 75) and (b_h >= 75):
                 ring_complete = "YES (Bite Ready!)"
             else:
                 ring_complete = "NO (Partial/Waiting)"
-
-        # 2. Minigame Bar analysis
+                
         hsv_b = cv2.cvtColor(bar_crop, cv2.COLOR_BGR2HSV)
         lower_green = np.array([75, 120, 100])
         upper_green = np.array([90, 255, 255])
@@ -567,16 +572,21 @@ class FishingBotGUI:
         
         green_found = "NO"
         green_bounds = "N/A"
-        annotated_bar = bar_crop.copy()
+        
+        bar_scale_x = (temp_bot.roi_bar["x2"] - temp_bot.roi_bar["x1"]) / temp_bot.roi_bar["ref_w"]
+        bar_scale_y = (temp_bot.roi_bar["y2"] - temp_bot.roi_bar["y1"]) / temp_bot.roi_bar["ref_h"]
+        
         if len(x_g) > 0:
             green_found = "YES"
             g_start, g_end = np.min(x_g), np.max(x_g)
             green_bounds = f"{g_start} to {g_end}"
-            # Draw green boundaries on display image
-            cv2.line(annotated_bar, (g_start, 0), (g_start, bar_crop.shape[0]), (0, 255, 0), 2)
-            cv2.line(annotated_bar, (g_end, 0), (g_end, bar_crop.shape[0]), (0, 255, 0), 2)
+            
+            gx1 = int(temp_bot.roi_bar["x1"] - left + g_start * bar_scale_x)
+            gx2 = int(temp_bot.roi_bar["x1"] - left + g_end * bar_scale_x)
+            gy1 = int(temp_bot.roi_bar["y1"] - top)
+            gy2 = int(temp_bot.roi_bar["y2"] - top)
+            cv2.rectangle(annotated_full, (gx1, gy1), (gx2, gy2), (0, 255, 0), 3)
 
-        # Indicator analysis
         detected_ind_x = []
         for x in range(50, 310):
             col_matches = 0
@@ -595,66 +605,146 @@ class FishingBotGUI:
             ind_found = "YES"
             ind_x = int(np.median(detected_ind_x))
             ind_pos = f"X = {ind_x}"
-            # Draw red circle at indicator
-            cv2.circle(annotated_bar, (ind_x, 15), 4, (0, 0, 255), -1)
-
-        # 3. Success Banner Analysis
+            
+            ix = int(temp_bot.roi_bar["x1"] - left + ind_x * bar_scale_x)
+            iy = int(temp_bot.roi_bar["y1"] - top + 15 * bar_scale_y)
+            cv2.circle(annotated_full, (ix, iy), 6, (0, 0, 255), -1)
+            
         gray_s = cv2.cvtColor(success_crop, cv2.COLOR_BGR2GRAY)
         white_pixels = np.sum(gray_s > 200)
-        success_detected = "YES" if white_pixels > 200 else "NO"
+        success_detected = "YES" if (white_pixels > 300) else "NO"
 
-        # Create pop-up window
         if crop_window and tk.Toplevel.winfo_exists(crop_window):
             crop_window.destroy()
             
         crop_window = tk.Toplevel(self.root)
-        crop_window.title("Visual Calibration Preview")
-        crop_window.geometry("500x520")
+        crop_window.title("Visual Calibration Preview & Editor")
+        crop_window.geometry("950x750")
         crop_window.configure(bg=BG_CARD)
         
-        # Prevent window garbage collection for images
         crop_window.images = []
 
-        tk.Label(crop_window, text="CALIBRATION CROPS", font=("Segoe UI", 12, "bold"), bg=BG_CARD, fg=ACCENT_BLUE).pack(pady=10)
+        tk.Label(crop_window, text="DRAG RECTANGLES TO CALIBRATE", font=("Segoe UI", 12, "bold"), bg=BG_CARD, fg=ACCENT_BLUE).pack(pady=10)
 
-        # 1. F-Icon Section
-        f_frame = ttk.LabelFrame(crop_window, text="F-Button Detector ROI", padding=5)
-        f_frame.pack(fill="x", padx=15, pady=5)
+        img_frame = ttk.Frame(crop_window, style="Card.TFrame")
+        img_frame.pack(fill="both", expand=True, padx=15, pady=5)
         
-        f_photo = self.cv2_to_photo(f_crop)
-        crop_window.images.append(f_photo)
-        tk.Label(f_frame, image=f_photo).pack(side="left", padx=10)
-        
-        f_text = f"Blue quadrant analysis:\n{bite_analysis}\nRing Completed: {ring_complete}"
-        tk.Label(f_frame, text=f_text, justify="left", font=("Segoe UI", 9)).pack(side="left", padx=10)
+        max_width = 850
+        max_height = 420
+        h_img, w_img = annotated_full.shape[:2]
+        scale = min(max_width / w_img, max_height / h_img)
+        if scale < 1.0:
+            new_w, new_h = int(w_img * scale), int(h_img * scale)
+            display_img = cv2.resize(annotated_full, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        else:
+            scale = 1.0
+            display_img = annotated_full.copy()
+            new_w, new_h = w_img, h_img
 
-        # 2. Minigame Bar Section
-        bar_frame = ttk.LabelFrame(crop_window, text="Progress Bar ROI (Steering Target)", padding=5)
-        bar_frame.pack(fill="x", padx=15, pady=5)
+        full_photo = self.cv2_to_photo(display_img)
+        crop_window.images.append(full_photo)
         
-        bar_photo = self.cv2_to_photo(annotated_bar)
-        crop_window.images.append(bar_photo)
-        tk.Label(bar_frame, image=bar_photo).pack(side="top", pady=5)
+        canvas = tk.Canvas(img_frame, width=new_w, height=new_h, bg=BG_CARD, highlightthickness=0)
+        canvas.pack(pady=5)
+        canvas.create_image(0, 0, anchor="nw", image=full_photo)
         
-        bar_text = f"Green Zone Detected: {green_found} (Bounds: {green_bounds})\nIndicator Found: {ind_found} ({ind_pos})"
-        tk.Label(bar_frame, text=bar_text, justify="center", font=("Segoe UI", 9)).pack(side="top", pady=5)
+        crop_window.rects = {}
+        crop_window.drag_data = {"item": None, "key": None, "x": 0, "y": 0}
+        
+        roi_refs = {
+            "BAR_REF": temp_bot.roi_bar,
+            "F_ICON_REF": temp_bot.roi_f_icon,
+            "SUCCESS_REF": temp_bot.roi_success
+        }
+        colors = {"BAR_REF": "green", "F_ICON_REF": "orange", "SUCCESS_REF": "yellow"}
+        
+        for key, roi in roi_refs.items():
+            x1 = (roi["x1"] - left) * scale
+            y1 = (roi["y1"] - top) * scale
+            x2 = (roi["x2"] - left) * scale
+            y2 = (roi["y2"] - top) * scale
+            r_id = canvas.create_rectangle(x1, y1, x2, y2, outline=colors[key], width=2, tags=("draggable", key))
+            t_id = canvas.create_text(x1, y1 - 8, text=key, fill=colors[key], anchor="sw", font=("Segoe UI", 8), tags=("label", key))
+            crop_window.rects[key] = r_id
+            
+        def on_drag_start(event):
+            item = canvas.find_withtag("current")
+            if item:
+                tags = canvas.gettags(item[0])
+                if "draggable" in tags:
+                    crop_window.drag_data["item"] = item[0]
+                    crop_window.drag_data["key"] = tags[1]
+                    crop_window.drag_data["x"] = event.x
+                    crop_window.drag_data["y"] = event.y
 
-        # 3. Success Banner Section
-        success_frame = ttk.LabelFrame(crop_window, text="Success Screen Banner ROI", padding=5)
-        success_frame.pack(fill="x", padx=15, pady=5)
-        
-        success_photo = self.cv2_to_photo(success_crop)
-        crop_window.images.append(success_photo)
-        tk.Label(success_frame, image=success_photo).pack(side="left", padx=10)
-        
-        success_text = f"White Pixels (Threshold > 200): {white_pixels}\nSuccess Detected: {success_detected}"
-        tk.Label(success_frame, text=success_text, justify="left", font=("Segoe UI", 9)).pack(side="left", padx=10)
+        def on_drag_motion(event):
+            if crop_window.drag_data["item"]:
+                dx = event.x - crop_window.drag_data["x"]
+                dy = event.y - crop_window.drag_data["y"]
+                canvas.move(crop_window.drag_data["item"], dx, dy)
+                
+                labels = canvas.find_withtag(crop_window.drag_data["key"])
+                for label in labels:
+                    if label != crop_window.drag_data["item"]:
+                        canvas.move(label, dx, dy)
+                
+                crop_window.drag_data["x"] = event.x
+                crop_window.drag_data["y"] = event.y
 
-        # Close button
+        def on_drag_stop(event):
+            crop_window.drag_data["item"] = None
+            crop_window.drag_data["key"] = None
+            
+        canvas.tag_bind("draggable", "<ButtonPress-1>", on_drag_start)
+        canvas.tag_bind("draggable", "<B1-Motion>", on_drag_motion)
+        canvas.tag_bind("draggable", "<ButtonRelease-1>", on_drag_stop)
+        
+        def save_calibration():
+            import fishing_bot
+            new_refs = {}
+            for key, r_id in crop_window.rects.items():
+                c_x1, c_y1, c_x2, c_y2 = canvas.coords(r_id)
+                n_x1, n_y1 = c_x1 / scale, c_y1 / scale
+                n_x2, n_y2 = c_x2 / scale, c_y2 / scale
+                
+                ref_x1 = int(n_x1 * 1024 / width)
+                ref_y1 = int(n_y1 * 428 / height)
+                ref_x2 = int(n_x2 * 1024 / width)
+                ref_y2 = int(n_y2 * 428 / height)
+                
+                new_refs[key] = {"x1": ref_x1, "y1": ref_y1, "x2": ref_x2, "y2": ref_y2}
+                
+            fishing_bot.BAR_REF = new_refs["BAR_REF"]
+            fishing_bot.F_ICON_REF = new_refs["F_ICON_REF"]
+            fishing_bot.SUCCESS_REF = new_refs["SUCCESS_REF"]
+            fishing_bot.save_config()
+            
+            if bot_instance:
+                bot_instance.update_rois(window_rect)
+                
+            messagebox.showinfo("Success", "Calibration saved successfully!")
+            crop_window.destroy()
+        
+        info_text = (
+            f"F-Icon Status: {ring_complete} ({bite_analysis})\n"
+            f"Minigame Status: Green Zone {green_found} ({green_bounds}) | Indicator {ind_found} ({ind_pos})\n"
+            f"Success Status: {success_detected} (White Px: {white_pixels})\n\n"
+            "Arrastra los rectángulos con el ratón. Cuando estés listo, presiona Save Calibration."
+        )
+        tk.Label(crop_window, text=info_text, font=("Segoe UI", 10), bg=BG_CARD, fg=TEXT_PRIMARY, justify="center").pack(pady=10)
+
+        btn_frame = ttk.Frame(crop_window, style="Card.TFrame")
+        btn_frame.pack(pady=10)
+        
         tk.Button(
-            crop_window, text="Close Preview", bg=BG_MAIN, fg=TEXT_PRIMARY, bd=1, relief="solid",
-            cursor="hand2", command=crop_window.destroy, padx=15, pady=5
-        ).pack(pady=15)
+            btn_frame, text="Save Calibration", bg=ACCENT_GREEN, fg="white", bd=0, relief="flat",
+            cursor="hand2", command=save_calibration, padx=15, pady=8, font=("Segoe UI", 10, "bold")
+        ).pack(side="left", padx=10)
+        
+        tk.Button(
+            btn_frame, text="Cancel", bg=BG_MAIN, fg=TEXT_PRIMARY, bd=1, relief="solid",
+            cursor="hand2", command=crop_window.destroy, padx=15, pady=8, font=("Segoe UI", 10)
+        ).pack(side="left", padx=10)
 
     def cv2_to_photo(self, cv_img):
         """Converts BGR OpenCV image to ImageTk PhotoImage."""

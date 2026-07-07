@@ -5,6 +5,10 @@ import time
 import pydirectinput
 import keyboard
 import sys
+import math
+import random
+import os
+import json
 
 # --- CONFIGURATION ---
 # The script will automatically scale the detection regions based on these dimensions.
@@ -34,9 +38,114 @@ pydirectinput.PAUSE = 0.01
 # Progress Bar crop ROI
 BAR_REF = {"x1": 350, "y1": 15, "x2": 674, "y2": 60}
 # F-icon button crop ROI (detecting the blue ring)
-F_ICON_REF = {"x1": 900, "y1": 350, "x2": 1000, "y2": 420}
+F_ICON_REF = {"x1": 917, "y1": 350, "x2": 1017, "y2": 420}
 # Success Screen crop ROI
 SUCCESS_REF = {"x1": 380, "y1": 385, "x2": 640, "y2": 420}
+
+def load_config():
+    global BAR_REF, F_ICON_REF, SUCCESS_REF
+    if os.path.exists("config.json"):
+        try:
+            with open("config.json", "r") as f:
+                data = json.load(f)
+                if "BAR_REF" in data: BAR_REF = data["BAR_REF"]
+                if "F_ICON_REF" in data: F_ICON_REF = data["F_ICON_REF"]
+                if "SUCCESS_REF" in data: SUCCESS_REF = data["SUCCESS_REF"]
+        except Exception as e:
+            print(f"[Error] Failed to load config.json: {e}")
+
+def save_config():
+    data = {
+        "BAR_REF": BAR_REF,
+        "F_ICON_REF": F_ICON_REF,
+        "SUCCESS_REF": SUCCESS_REF
+    }
+    try:
+        with open("config.json", "w") as f:
+            json.dump(data, f, indent=4)
+    except Exception as e:
+        print(f"[Error] Failed to save config.json: {e}")
+
+load_config()
+
+
+class SimpleNeuralNetwork:
+    """A basic 3-layer Feedforward Neural Network for the agent."""
+    def __init__(self, input_size=3, hidden_size=5, output_size=3, weights=None):
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.output_size = output_size
+        
+        if weights is not None:
+            self.weights1 = weights[0].copy()
+            self.bias1 = weights[1].copy()
+            self.weights2 = weights[2].copy()
+            self.bias2 = weights[3].copy()
+        else:
+            # Initialize random weights and biases
+            self.weights1 = [[random.uniform(-1, 1) for _ in range(hidden_size)] for _ in range(input_size)]
+            self.bias1 = [random.uniform(-1, 1) for _ in range(hidden_size)]
+            self.weights2 = [[random.uniform(-1, 1) for _ in range(output_size)] for _ in range(hidden_size)]
+            self.bias2 = [random.uniform(-1, 1) for _ in range(output_size)]
+            
+    def to_dict(self):
+        return {
+            "weights1": self.weights1,
+            "bias1": self.bias1,
+            "weights2": self.weights2,
+            "bias2": self.bias2
+        }
+
+    def from_dict(self, data):
+        self.weights1 = data["weights1"]
+        self.bias1 = data["bias1"]
+        self.weights2 = data["weights2"]
+        self.bias2 = data["bias2"]
+            
+    def feed_forward(self, inputs):
+        # Hidden layer
+        hidden = []
+        for j in range(self.hidden_size):
+            val = sum(inputs[i] * self.weights1[i][j] for i in range(self.input_size)) + self.bias1[j]
+            # Tanh activation function
+            hidden.append(math.tanh(val))
+            
+        # Output layer
+        outputs = []
+        for k in range(self.output_size):
+            val = sum(hidden[j] * self.weights2[j][k] for j in range(self.hidden_size)) + self.bias2[k]
+            outputs.append(val)  # Linear output, will take argmax
+            
+        return outputs
+
+    def get_genome(self):
+        """Flattens the network weights and biases into a single list."""
+        genome = []
+        for row in self.weights1:
+            genome.extend(row)
+        genome.extend(self.bias1)
+        for row in self.weights2:
+            genome.extend(row)
+        genome.extend(self.bias2)
+        return genome
+
+    def set_genome(self, genome):
+        """Reconstructs the network weights from a flat list."""
+        idx = 0
+        for i in range(self.input_size):
+            for j in range(self.hidden_size):
+                self.weights1[i][j] = genome[idx]
+                idx += 1
+        for j in range(self.hidden_size):
+            self.bias1[j] = genome[idx]
+            idx += 1
+        for j in range(self.hidden_size):
+            for k in range(self.output_size):
+                self.weights2[j][k] = genome[idx]
+                idx += 1
+        for k in range(self.output_size):
+            self.bias2[k] = genome[idx]
+            idx += 1
 
 
 class InputController:
@@ -44,8 +153,19 @@ class InputController:
     def __init__(self):
         self.keys = {KEY_STEER_LEFT: False, KEY_STEER_RIGHT: False}
 
-    def press(self, key):
-        pydirectinput.press(key)
+    def press(self, key, duration=0.08):
+        pydirectinput.keyDown(key)
+        time.sleep(duration)
+        pydirectinput.keyUp(key)
+
+    def click_safe_area(self, window_rect):
+        """Clicks a safe area (top-left) to close screens that don't accept ESC."""
+        if window_rect:
+            x = window_rect[0] + 100
+            y = window_rect[1] + 100
+            pydirectinput.click(x=int(x), y=int(y))
+        else:
+            pydirectinput.click(100, 100)
 
     def set_key(self, key, press_down):
         if key not in self.keys:
@@ -66,7 +186,7 @@ class InputController:
 
 
 class FishingBot:
-    def __init__(self, window_rect=None, log_callback=None, status_callback=None, stats_callback=None):
+    def __init__(self, window_rect=None, log_callback=None, status_callback=None, stats_callback=None, steering_mode="Adaptive PD"):
         self.inputs = InputController()
         self.active = False
         self.running = True
@@ -80,9 +200,17 @@ class FishingBot:
         self.caught_count = 0
         self.lost_count = 0
         
+        self.steering_mode = steering_mode  # "Adaptive PD" or "Neural Network (Trained)"
+        self.nn = None
+        
         # Initialize adaptive AI controller
         from adaptive_controller import AdaptiveController
         self.controller = AdaptiveController()
+        
+        # Velocity and timing state tracking for NN inputs
+        self.last_sim_x = None
+        self.last_sim_target_x = None
+        self.last_update_time = None
         
         # Coordinates and ROI setup
         self.window_rect = window_rect
@@ -96,15 +224,17 @@ class FishingBot:
             print(message)
 
     def update_rois(self, window_rect):
-        """Re-calculates the regions of interest based on window coordinate offsets."""
+        """Updates ROIs from global references based on the provided window_rect"""
         self.window_rect = window_rect
         if window_rect:
             left, top, right, bottom = window_rect
-            w = right - left
-            h = bottom - top
-            self.roi_bar = self._scale_roi_with_offset(BAR_REF, left, top, w, h)
-            self.roi_f_icon = self._scale_roi_with_offset(F_ICON_REF, left, top, w, h)
-            self.roi_success = self._scale_roi_with_offset(SUCCESS_REF, left, top, w, h)
+            width = right - left
+            height = bottom - top
+            
+            # Re-scale from references
+            self.roi_bar = self._scale_roi_with_offset(BAR_REF, left, top, width, height)
+            self.roi_f_icon = self._scale_roi_with_offset(F_ICON_REF, left, top, width, height)
+            self.roi_success = self._scale_roi_with_offset(SUCCESS_REF, left, top, width, height)
         else:
             self.roi_bar = self._scale_roi(BAR_REF)
             self.roi_f_icon = self._scale_roi(F_ICON_REF)
@@ -139,6 +269,8 @@ class FishingBot:
         self.inputs.release_all()
         if self.active:
             self.log("\n>>> BOT STARTED! Standing at a fishing spot. <<<")
+            self.log("Waiting 1 second for you to focus the game window...")
+            time.sleep(1.0)
             self.set_state("CAST_ROD")
         else:
             self.log("\n>>> BOT PAUSED! <<<")
@@ -168,7 +300,28 @@ class FishingBot:
         resized = cv2.resize(img, (roi["ref_w"], roi["ref_h"]), interpolation=cv2.INTER_LINEAR)
         return resized
 
+    def load_nn(self):
+        if os.path.exists("ai_neural_net.json"):
+            try:
+                with open("ai_neural_net.json", "r") as f:
+                    data = json.load(f)
+                nn = SimpleNeuralNetwork()
+                nn.from_dict(data)
+                self.log("[System] Loaded Neural Network weights from 'ai_neural_net.json' successfully.")
+                return nn
+            except Exception as e:
+                self.log(f"[Error] Failed to load neural network weights: {e}")
+        else:
+            self.log("[Error] 'ai_neural_net.json' not found! Train the AI first using the simulator.")
+        return None
+
     def run(self):
+        if self.steering_mode == "Neural Network (Trained)":
+            self.nn = self.load_nn()
+            if self.nn is None:
+                self.log("[Warning] Falling back to Adaptive PD steering.")
+                self.steering_mode = "Adaptive PD"
+
         self.log("=" * 60)
         self.log("          NTE AUTOMATIC FISHING BOT (ADAPTIVE AI)")
         self.log("=" * 60)
@@ -216,9 +369,10 @@ class FishingBot:
                     gray = cv2.cvtColor(success_crop, cv2.COLOR_BGR2GRAY)
                     white_pixels = np.sum(gray > 200)
                     
-                    if white_pixels > 350:
-                        self.log(f"\n[Warning] Victory screen is still open (White px: {white_pixels})! Pressing ESC again...")
+                    if white_pixels > 300:
+                        self.log(f"\n[Warning] Victory screen is still open (White px: {white_pixels})! Pressing ESC and clicking...")
                         self.inputs.press(KEY_CLOSE_SCREEN)
+                        self.inputs.click_safe_area(self.window_rect)
                         time.sleep(2.0)  # Wait for it to close
                         continue  # Skip casting and re-evaluate on the next iteration
                         
@@ -241,21 +395,30 @@ class FishingBot:
                     
                     y_indices, x_indices = np.where(mask_blue > 0)
                     
-                    # Check quadrant distribution around center (67, 35) to verify it's a complete ring
+                    # Check quadrant distribution around the white hook icon to verify it's a complete ring
                     if len(x_indices) > 0:
-                        center_x = 67
-                        center_y = 35
-                        
+                        # Find the white hook icon to use as center
+                        gray_f = cv2.cvtColor(f_crop, cv2.COLOR_BGR2GRAY)
+                        wy, wx = np.where(gray_f > 200)
+                        if len(wx) > 5:
+                            center_x = int(np.median(wx))
+                            center_y = int(np.median(wy))
+                        else:
+                            center_x, center_y = 50, 35
+                            
                         left_half = np.sum(x_indices < center_x)
                         right_half = np.sum(x_indices >= center_x)
                         top_half = np.sum(y_indices < center_y)
                         bottom_half = np.sum(y_indices >= center_y)
                         
-                        # A complete circle will have high counts in all 4 quadrants (at least 35 px each)
-                        if (left_half >= 35) and (right_half >= 35) and (top_half >= 35) and (bottom_half >= 35):
+                        # A complete circle will have high counts in all 4 quadrants (at least 75 px each)
+                        if (left_half >= 75) and (right_half >= 75) and (top_half >= 75) and (bottom_half >= 75):
                             self.log(f"\n[BITE DETECTED!] F-icon blue ring complete. (L:{left_half}, R:{right_half}, T:{top_half}, B:{bottom_half})")
                             self.inputs.press(KEY_CAST_REEL)
                             self.controller.reset()  # Reset adaptive AI controller for a new fish
+                            self.last_sim_x = None
+                            self.last_sim_target_x = None
+                            self.last_update_time = None
                             self.set_state("FISHING_MINIGAME")
                             self.consecutive_no_minigame = 0
                             time.sleep(0.5)  # Wait for minigame UI to load
@@ -302,34 +465,89 @@ class FishingBot:
                         if col_matches >= 3:
                             detected_ind_x.append(x)
                             
-                    # 3. Decision making (Adaptive AI Controller)
+                    # 3. Decision making
                     if detected_ind_x:
                         ind_x = int(np.median(detected_ind_x))
                         
-                        steer_key, pulse_duration, ai_log = self.controller.update(ind_x, green_start, green_end)
-                        if ai_log:
-                            self.log(ai_log)
+                        if self.steering_mode == "Neural Network (Trained)" and self.nn is not None:
+                            # Neural Network Steering Mode
+                            current_time = time.time()
+                            # Convert coordinates to simulator's normalized 0-100 system
+                            sim_x = (ind_x - 50.0) / 260.0 * 100.0
+                            green_center = (green_start + green_end) / 2.0
+                            sim_target_x = (green_center - 50.0) / 260.0 * 100.0
                             
-                        # Apply pulsed key command
-                        if steer_key == 'd':
-                            self.inputs.set_key(KEY_STEER_LEFT, False)
-                            self.inputs.set_key(KEY_STEER_RIGHT, True)
-                            if pulse_duration > 0:
-                                time.sleep(pulse_duration)
+                            if self.last_update_time is not None and current_time > self.last_update_time:
+                                dt = current_time - self.last_update_time
+                                dt = max(0.005, min(0.1, dt))
+                                v = (sim_x - self.last_sim_x) / dt
+                                target_v = (sim_target_x - self.last_sim_target_x) / dt
+                            else:
+                                v = 0.0
+                                target_v = 0.0
+                                
+                            self.last_sim_x = sim_x
+                            self.last_sim_target_x = sim_target_x
+                            self.last_update_time = current_time
+                            
+                            # Clamp velocities
+                            v = max(-30.0, min(30.0, v))
+                            target_v = max(-30.0, min(30.0, target_v))
+                            
+                            # Normalize inputs for the feed forward
+                            relative_error = (sim_x - sim_target_x) / 50.0
+                            norm_v = v / 15.0
+                            norm_target_v = target_v / 15.0
+                            
+                            inputs = [relative_error, norm_v, norm_target_v]
+                            outputs = self.nn.feed_forward(inputs)
+                            
+                            # Output action selection
+                            act_idx = outputs.index(max(outputs))
+                            if act_idx == 0:
+                                steer_key = 'a'
+                            elif act_idx == 1:
+                                steer_key = 'd'
+                            else:
+                                steer_key = None
+                                
+                            # Apply actions continuously
+                            if steer_key == 'a':
                                 self.inputs.set_key(KEY_STEER_RIGHT, False)
-                        elif steer_key == 'a':
-                            self.inputs.set_key(KEY_STEER_RIGHT, False)
-                            self.inputs.set_key(KEY_STEER_LEFT, True)
-                            if pulse_duration > 0:
-                                time.sleep(pulse_duration)
+                                self.inputs.set_key(KEY_STEER_LEFT, True)
+                            elif steer_key == 'd':
                                 self.inputs.set_key(KEY_STEER_LEFT, False)
+                                self.inputs.set_key(KEY_STEER_RIGHT, True)
+                            else:
+                                self.inputs.set_key(KEY_STEER_LEFT, False)
+                                self.inputs.set_key(KEY_STEER_RIGHT, False)
                         else:
-                            self.inputs.set_key(KEY_STEER_LEFT, False)
-                            self.inputs.set_key(KEY_STEER_RIGHT, False)
+                            # Adaptive PD Steering Mode (default)
+                            steer_key, pulse_duration, ai_log = self.controller.update(ind_x, green_start, green_end)
+                            if ai_log:
+                                self.log(ai_log)
+                                
+                            # Apply pulsed key command
+                            if steer_key == 'd':
+                                self.inputs.set_key(KEY_STEER_LEFT, False)
+                                self.inputs.set_key(KEY_STEER_RIGHT, True)
+                                if pulse_duration > 0:
+                                    time.sleep(pulse_duration)
+                                    self.inputs.set_key(KEY_STEER_RIGHT, False)
+                            elif steer_key == 'a':
+                                self.inputs.set_key(KEY_STEER_RIGHT, False)
+                                self.inputs.set_key(KEY_STEER_LEFT, True)
+                                if pulse_duration > 0:
+                                    time.sleep(pulse_duration)
+                                    self.inputs.set_key(KEY_STEER_LEFT, False)
+                            else:
+                                self.inputs.set_key(KEY_STEER_LEFT, False)
+                                self.inputs.set_key(KEY_STEER_RIGHT, False)
                     else:
                         # Indicator not found -> Release keys to avoid drift
                         self.inputs.set_key(KEY_STEER_LEFT, False)
                         self.inputs.set_key(KEY_STEER_RIGHT, False)
+                        self.last_update_time = None
 
                 elif self.state == "CHECK_SUCCESS":
                     self.inputs.release_all()
@@ -344,7 +562,7 @@ class FishingBot:
                         gray = cv2.cvtColor(success_crop, cv2.COLOR_BGR2GRAY)
                         white_pixels = np.sum(gray > 200)
                         
-                        if white_pixels > 350:
+                        if white_pixels > 300:
                             success_detected = True
                             self.caught_count += 1
                             self.log(f"\n[FISH CAUGHT!] Victory screen detected! (White px: {white_pixels}) | Total caught: {self.caught_count}")
@@ -354,8 +572,9 @@ class FishingBot:
                         time.sleep(0.1)
                         
                     if success_detected:
-                        self.log(f"Closing victory screen... (pressing {KEY_CLOSE_SCREEN.upper()})")
+                        self.log(f"Closing victory screen... (pressing {KEY_CLOSE_SCREEN.upper()} and clicking)")
                         self.inputs.press(KEY_CLOSE_SCREEN)
+                        self.inputs.click_safe_area(self.window_rect)
                         time.sleep(4.5)  # Wait for screen close animation to complete
                     else:
                         self.lost_count += 1
